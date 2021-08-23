@@ -1,4 +1,4 @@
-# WARNING: This helper was made for a 1680x1050 monitor. If you need to use it on a monitor with a different resolution, make an issue at https://github.com/helpimnotdrowning/random-py3/issues
+# WARNING: This helper was made for a 1680x1050 monitor. If you need to use it on a monitor with a different resolution, make an issue at https://github.com/helpimnotdrowning/tweet_screencap/issues
 
 import re
 import pyautogui as phk
@@ -33,6 +33,17 @@ def fix_int(string):
 def find_time():
     # Instead of searching the whole screen, search only in the middle-bottom-left (in that order). gives a bit of speedup
     screenshot = phk.screenshot(region=(666,984,145,22))
+    #screenshot.show()
+    
+    # fimg_coords = phk.locate(b64_2_PIL_Image(find1), screenshot)
+    
+    # if not fimg_coords:
+        # fimg_coords = phk.locate(b64_2_PIL_Image(find2), screenshot)
+        
+    # if not fimg_coords:
+        # raise RuntimeError('Couldn\'t locate find.png on-screen. Make sure MPC-HC is open.')
+        
+    # time_img = screenshot.crop((fimg_coords[0]-175,fimg_coords[1]-6,fimg_coords[0],fimg_coords[1] + fimg_coords[3]+6))
     
     return image_to_string(asarray(screenshot), config="-c tessedit_char_whitelist=0123456789:.\/")
     
@@ -51,19 +62,19 @@ def fix_time(time):
     # if the video is longer than an hour, MPC-HC will add a XX: to the start of the video elapsed time
     # it does not remove a XX: if the video is shorter than a minute, however.
     if re.fullmatch('(\d\d:){1}\d\d\.\d\d\d', stripped_time):
-        fixed_time = ','.join(['0', fix_int(stripped_time[0:2]), fix_int(stripped_time[3:5]), fix_int(stripped_time[6:9])])
+        fixed_time = ', '.join(['0', fix_int(stripped_time[0:2]), fix_int(stripped_time[3:5]), fix_int(stripped_time[6:9])])
         
     elif re.fullmatch('(\d\d:){2}\d\d\.\d\d\d',stripped_time):
-        fixed_time = ','.join([fix_int(stripped_time[0:2]), fix_int(stripped_time[3:5]), fix_int(stripped_time[6:8]), fix_int(stripped_time[9:12])])
+        fixed_time = ', '.join([fix_int(stripped_time[0:2]), fix_int(stripped_time[3:5]), fix_int(stripped_time[6:8]), fix_int(stripped_time[9:12])])
         
     else:
         print(f'\n\n{stripped_time}\n\n')
         raise RuntimeError('Time could not be fixed.')
         
     # paste directly into tweet_screencap.py
-    return f'''sec = time_to_seconds({fixed_time})
-                elif sec == time_to_seconds({fixed_time}):  '''
-    
+    return f'''self.sec = time_to_seconds({fixed_time})
+                    elif self.sec == time_to_seconds({fixed_time}):  '''
+
     
 def on_press(key):
     pass
@@ -97,6 +108,8 @@ if __name__ == '__main__':
     print("ello & ready, press SHIFT to go")
     
     # Collect events until released
-    with Listener(on_press=on_press, on_release=on_release) as listener:
+    with Listener(
+        on_press=on_press,
+        on_release=on_release) as listener:
         listener.join()
         
