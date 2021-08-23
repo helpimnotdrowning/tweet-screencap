@@ -9,6 +9,12 @@ from numpy import asarray
 from base64 import b64decode
 from PIL.Image import open
 from pyperclip import copy as to_clipboard
+"""
+A quick guide to installing pytesseract on Windows, because it's difficult for some reason:
+    1) Download the latest 64 bit installer from here : https://github.com/UB-Mannheim/tesseract/wiki#tesseract-installer-for-windows
+    2) Install it for all users (install for current user *might* work, but not sure)
+    3) Install pytesseract using pip ( `pip install pytesseract` )
+"""
 from pytesseract import image_to_string
 from pynput.keyboard import Key, Listener, Controller
 
@@ -33,17 +39,6 @@ def fix_int(string):
 def find_time():
     # Instead of searching the whole screen, search only in the middle-bottom-left (in that order). gives a bit of speedup
     screenshot = phk.screenshot(region=(666,984,145,22))
-    #screenshot.show()
-    
-    # fimg_coords = phk.locate(b64_2_PIL_Image(find1), screenshot)
-    
-    # if not fimg_coords:
-        # fimg_coords = phk.locate(b64_2_PIL_Image(find2), screenshot)
-        
-    # if not fimg_coords:
-        # raise RuntimeError('Couldn\'t locate find.png on-screen. Make sure MPC-HC is open.')
-        
-    # time_img = screenshot.crop((fimg_coords[0]-175,fimg_coords[1]-6,fimg_coords[0],fimg_coords[1] + fimg_coords[3]+6))
     
     return image_to_string(asarray(screenshot), config="-c tessedit_char_whitelist=0123456789:.\/")
     
