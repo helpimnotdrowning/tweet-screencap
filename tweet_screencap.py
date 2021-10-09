@@ -5,396 +5,406 @@
 
 # TODO: Add check to see if ffmpeg/ffprobe is installed
 
-import os # check for pick up time
-import cv2 # save frame temporarily
-import sys
-import tweepy # twitter api 
 import logging
-import schedule # schedule send tweets
-import subprocess # use ffprobe to check video length
+import os
+import sys
+from dataclasses import dataclass
+from time import gmtime, strftime
+from time import sleep
+from typing import Callable, TYPE_CHECKING
 
-from time import sleep # make cpu not explode, time formatting
-from random import choices, random # for choosing how much time to proceed each frame
-from socket import timeout # catch some errors hopefully
+import schedule
+import tweepy
 
-try:
-    import get_frame
-except ModuleNotFoundError:
-    raise ModuleNotFoundError('get_frame.py not in current directory. Download from https://github.com/helpimnotdrowning/random-py3/blob/master/get_frame.py')
+import get_frame
+from get_frame import _read_image as read_image, _save_image as save_image
+
+testing_mode = False
+
+
+def get_logger(name: str) -> logging.Logger:
+    """Make logger."""
     
-try:
-    from hdutil import time_to_seconds, seconds_to_time
-    import hdutil
-except ModuleNotFoundError:
-    raise ModuleNotFoundError('hdutil.py not in current directory. Download from https://github.com/helpimnotdrowning/random-py3/blob/master/hdutil.py')
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.DEBUG)
     
-# setup tweepy auth
-# get yer own keys
-consumer_key = "0"
-consumer_secret = "0"
-
-access_token = "0"
-access_token_secret = "0"
-
-auth = tweepy.OAuthHandler(consumer_key, consumer_secret)
-auth.set_access_token(access_token, access_token_secret)
-
-api = tweepy.API(auth)
-
-sec = 1
-video_index = 0
-season_index = 0
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.DEBUG)
+    
+    ch.setFormatter(logging.Formatter(
+        '[%(asctime)s.%(msecs)03d] [%(name)s/%(levelname)s]: %(message)s', '%H:%M:%S'
+    ))
+    
+    logger.addHandler(ch)
+    
+    return logger
 
 
+def self_do_nothing_if(check_func: Callable, message: str = None) -> Callable:
+    """
+    Decorator to skip a function inside a class when `check_func` is `True`
+    
+    `check_func` is a function that returns a `bool`, preferably like `lambda self: self.skip_functions`
+    """
+    
+    def decorator(func):
+        def wrapper(self, *args, **kwargs):
+            if check_func(self):
+                get_logger("SelfDoNothingIf").info(f"Skipping {func.__qualname__}(){f': {message}' if message != None else ''}")
+                del logging.Logger.manager.loggerDict['SelfDoNothingIf']
+            else:
+                return func(self, *args, **kwargs)
+        
+        return wrapper
+    
+    return decorator
+
+
+def write_file(file: str, content: str) -> None:
+    """Writes to a file"""
+    with open(file, 'w+') as file_:
+        file_.write(str(content))
+
+
+def read_file(file: str) -> str:
+    """Return file"""
+    with open(file, 'r') as file_:
+        return file_.read()
+
+
+def time_to_seconds(hours=0, minutes=0, seconds=0, ms=0) -> float:
+    """Convert time to seconds.milliseconds."""
+    hour_in_minutes = hours * 60
+    minutes += hour_in_minutes
+    seconds += (minutes * 60) + (ms * .001)
+    return float(seconds)
+
+
+def seconds_to_time(seconds: float) -> str:
+    """Convert seconds to time in HH:MM:SS.ms format."""
+    return strftime("%H:%M:%S", gmtime(seconds)) + str(round(seconds % 1, 3))[1:]
+
+
+def s_if(condition) -> str:
+    """Little function to pluralize some words so I don't have to write some if statement everytime."""
+    return 's' if condition else ''
+
+
+class OutOfFramesError(Exception):
+    pass
+
+
+@dataclass
+class Episode:
+    """Dataclass to hold path to episode and its name. The order is reversed for some reason, but I don't mind it."""
+    path: str
+    name: str
+
+
+@dataclass
 class Season:
-    def __init__(self, name:str, videos: list):
-        self.name = name
-        self.videos = videos
-        
-       
+    """Dataclass to hold seaosn name and the Episodes it contains."""
+    name: str
+    episodes: list[Episode]
+
+
+@dataclass
 class Series:
-    def __init__(self, name:str, seasons: list[Season]):
-        self.name = name
-        self.seasons = seasons
-        
-s1_epsodes = [
-    'put/path_to/1st_video.here',
-    'and_the/second_one.here',
-    'and_just_keep/doing.that',
-    'and_dont/put/a_comma_after_the/last.item'
-]
-
-s2_episodes = [
-    'you_can/also_make_another/set/season_after_the/last.one',
-    'you_can_name_the_sets/whatever/you.like',
-]
-
-movie_episodes = [
-    'just_remember_to/put_them_in_the_correct.order',
-    r'and\for_windows_paths\with_the_other_slashes_you\need_to_have_an_r_before\the.quote'
-]
- 
-s1    = Season('Series Name! Season 1 (Series!)', s1_epsodes)
-s2    = Season('Series Name! Season 2 (Series!!)', s2_episodes)
-movie = Season('Series Name!: The Movie', movie_episodes)
-
-# if they arent in correct order, it will mess up
-series = Series('Series Name!', [ s1, s2, movie ])
-
-# setup logging
-logger = logging.getLogger("main")
-logger.setLevel(logging.DEBUG)
-
-ch = logging.StreamHandler()
-ch.setLevel(logging.DEBUG)
-
-ch.setFormatter(logging.Formatter('[%(asctime)s.%(msecs)03d] [%(name)s/%(levelname)s]: %(message)s', '%H:%M:%S'))
-logger.addHandler(ch)
-
-dont_save = False
+    """Dataclass to hold series name and the seasons it contains."""
+    name: str
+    seasons: list[Season]
 
 
-def read_state():
-    global sec
-    global season_index
-    global video_index
+class TwitterAPI:
+    """Wrapper for Tweepy's Twitter API to make my life easier."""
     
-    # if its the first time running the bot (at least in current directory), make a "pick up" file,
-    # so in case the bot crashes, pc crashes, blackout, the bot can pick up where it left off
-    if not os.path.exists("./pick_up_time.txt"):
-        hdutil.write_file("./pick_up_time.txt", "1") # start at beginning of video
+    # TODO: Make testing_mode passed as arg to __init__ instead of each individual method
+    def __init__(self, consumer_key, consumer_secret, access_token, access_token_secret):
+        self.api = self.authenticate(consumer_key, consumer_secret, access_token, access_token_secret)
         
-    if not os.path.exists('./pick_up_video.txt'):
-        hdutil.write_file("./pick_up_video.txt", '0') # start at first video
+        self.log = get_logger("TwitterAPI")
+    
+    def authenticate(self, consumer_key: str, consumer_secret: str, access_token: str, access_token_secret: str) -> tweepy.api:
+        """Authenticate to Twitter API."""
         
-    if not os.path.exists('./pick_up_season.txt'):
-        hdutil.write_file("./pick_up_season.txt", "0") # start at first season
+        auth = tweepy.OAuthHandler(consumer_key, consumer_secret)
+        auth.set_access_token(access_token, access_token_secret)
         
-    _sec = hdutil.read_file("./pick_up_time.txt")
+        return tweepy.API(auth)
     
-    # check if pick_up_time.txt is a tuple, if it is separate the 4 numbers expected into a list
-    if str(_sec).startswith('('):
-        time_split = str(_sec).replace('(','').replace(')','').split(',')
+    @self_do_nothing_if(lambda self: testing_mode, "Text tweet not sent.")
+    def tweet_text(self, text: str) -> None:
+        """Send tweet with text."""
         
-        # convert them all to numbers
-        for i in range(len(time_split)):
-            time_split[i] = int(time_split[i])
-            
-        # set sec to that
-        sec = float(time_to_seconds(time_split[0], time_split[1], time_split[2], time_split[3]))
+        self.api.update_status(status=text)
+        self.log.debug('Text tweet sent.')
+    
+    @self_do_nothing_if(lambda self: testing_mode, "Image tweet not sent.")
+    def tweet_image(self, image_path: str) -> None:
+        """Send a tweet with a single image."""
+        # TODO: Multiple images? may help if people use this for other types of image bots.
         
-    # else, if its just a normal number like what this script saves, dont do funny stuff with it
-    else:
-        sec = float(_sec)
+        media_id = self.api.media_upload(filename=image_path).media_id_string
+        self.api.update_status(media_ids=[media_id])
         
-    season_index = int(hdutil.read_file("./pick_up_season.txt"))
+        self.log.debug('Image tweet sent.')
     
-    video_index = int(hdutil.read_file("./pick_up_video.txt"))
-    
-    logger.debug('Picking up at season %s, video %s at %s (%s)', season_index + 1, video_index + 1, seconds_to_time(sec), sec)
-    
-    
-def save_state():
-    logger.debug('Saving state...')
-    
-    if dont_save == True:
-        logger.debug('State not saved.')
-    else:
-        hdutil.write_file("./pick_up_time.txt", sec)
-        hdutil.write_file("./pick_up_video.txt", video_index)
-        hdutil.write_file("./pick_up_season.txt", season_index)
+    @self_do_nothing_if(lambda self: testing_mode, "Bio not updated.")
+    def update_bio(self, bio_text: str) -> None:
+        self.api.update_profile(description=bio_text)
+        self.log.debug('Bio updated.')
+
+
+class ScreencapBot:
+    def __init__(self, argv: list[str], keyfile: str):
+        self.login(keyfile)
         
+        self.log = get_logger("ScreencapBot")
         
-def reset_state():
-    logger.warning('Clearing state...')
+        self.sec, self.episode, self.season = self.load_state()
+        self.next_frame_custom_image = False
+        self.custom_frame = ''
+        
+        # Add seasons, episodes in order.
+        self.series = Series('Series Name!', [
+            Season('Series Name! Season 1 (Series!)', [
+                Episode('C:/path/to/season1/video1.mp4', "Episode 1"),
+                Episode("C:/path/to/season1/video2.mp4", "Episode 2"),
+                Episode("C:/path/to/season1/video3.mkv", "Episode 3"),
+            ]),
+            Season('Series Name! Season 2 (Series!!)', [
+                Episode("C:/path/to/season2/video1.mp4", "Episode 1"),
+                Episode("C:/path/to/season2/video2.mp4", "Episode 2"),
+                Episode("C:/path/to/season2/video3.mkv", "Episode 3"),
+            ]),
+            Season('Series Name!: The Movie', [
+                Episode("C:/path/to/movie/movie.mkv", "Movie")
+            ])
+        ])
+        
+        self.parse_args(argv)
+        
+        schedule.every().hour.at(":00").do(self.main)
+        schedule.every().hour.at(":30").do(self.main)
+        
+        while True:
+            schedule.run_pending()
+            sleep(1)
     
-    delete_file("./pick_up_time.txt")
-    delete_file("./pick_up_video.txt")
-    delete_file("./pick_up_season.txt")
-    exit()
-    
-    
-# upload image to twitter, keep retrying untill success
-def upload_image_to_twitter(path):
-    logger.debug('Uploading image to Twitter...')
-    
-    if api == None:
-        cv2.imwrite('upload.png', hdutil.read_image(path))
-        return 0
-    else:
-        logger.warning('ACTUALLY UPLOADING FOR REAL THIS TIME!!!!')
+    def login(self, keyfile: str) -> tweepy.api:
+        """Load keyfile containing your Twitter API keys, login to Twitter"""
         try:
-            return api.media_upload(filename=path).media_id_string
-        except timeout:
-            raise timeout('Timed out.')
-            
-# send tweet, keep retrying untill success
-def send_tweet_with_media(media_id):
-    logger.debug('Sending Tweet...')
-    
-    if api == None:
-        logger.info('Tweet would have been sent here.')
-    else:
-        try:
-            api.update_status(media_ids=[media_id])
-        except timeout:
-            raise timeout('Timed out.')
-    
-    
-# send tweet, keep retrying untill success
-def send_tweet_with_text(status_text):
-    logger.debug('Sending Tweet...')
-    
-    if api == None:
-        logger.info('Tweet would have been sent here.')
-    else:
-        try:
-            api.update_status(status=str(status_text))
-        except timeout:
-            raise timeout('Timed out.')
-        #except tweepy.error.TweepError as e:
-            #if e.api_code == '
-            
-            
-def update_bio(bio_text):
-    if api == None:
-        logger.info('Bio would have been sent here.')
-    else:
-        try:
-            api.update_profile(description="""TODO: add description """)
-        except timeout:
-            raise timeout('Timed out.')
-            
-            
-def randrange_OLD():
-    seq = [ 1, 2, 3, 4, 5, 6]
-    wgt = [18,22,23,13,12,10]
-    rand_choice = choices(seq, weights = wgt)
-    return rand_choice[0]
-    
-    
-def randrange():
-    seq = [1,  2,  3,  4,  5 ]
-    wgt = [14, 28, 28, 20, 10]
-    #wgt = [16,42,42] 
-    #wgt = [12,28,28,28] # out of 100
-    rand_choice = choices(seq, weights = wgt)
-    # choices returns a list
-    return rand_choice[0] + round(random(), 3) # tack on some milliseconds so it cant only send frames on the 0
-    
-    
-# https://stackoverflow.com/a/3844467
-def get_length(filename):
-    result = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", filename],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT)
-    return float(result.stdout)
-    
-    
-# TODO: WHY DOES THIS WORK SO WELL?????
-def get_video():
-    global sec
-    global video_index
-    global season_index
-    
-    # try to set season, if more seasons than exist (series over), exit
-    try:
-        season = series.seasons[season_index]
-    except IndexError:
-        exit()
+            _key_file = read_file(keyfile)
+        except FileNotFoundError:
+            write_file('./ScreencapBot.kyf',"""CONSUMER_KEY
+CONSUMER_SECRET
+ACCESS_TOKEN
+ACCESS_TOKEN_SECRET""")
+            raise FileNotFoundError("Your keyfile was not found. Please fill out the shiny and newly made keyfile at ./ScreencapBot.kyf.") from None
         
-    # try to set video, if more videos than exist (season over), go to next season and reset video to 0
-    try:
-        video = season.videos[video_index]
-        print(video, video_index)
-    except IndexError:
-        season_index += 1
-        video_index = 0
-        video = get_video()
+        _key_file_split = _key_file.splitlines()
         
-    return video
+        if len(_key_file_split) != 4:
+            raise ValueError(f"""Keyfile {keyfile} is improperly formatted: expected format is:
+CONSUMER_KEY
+CONSUMER_SECRET
+ACCESS_TOKEN
+ACCESS_TOKEN_SECRET""")
+        
+        CONSUMER_KEY = _key_file_split[0]
+        CONSUMER_SECRET = _key_file_split[1]
+        ACCESS_TOKEN = _key_file_split[2]
+        ACCESS_TOKEN_SECRET = _key_file_split[3]
+        
+        self.api = TwitterAPI(CONSUMER_KEY, CONSUMER_SECRET, ACCESS_TOKEN, ACCESS_TOKEN_SECRET)
     
-    
-def next_video_please():
-    global video_index
-    global sec
-    
-    video_index += 1
-    sec = 0
-    logger.info("Episode over, switching to next.")
+    def parse_args(self, argv) -> None:
+        """Parse command line args"""
+        global testing_mode
+        self.log.debug(f"CMD args: {argv}")
+        
+        if '-h' in argv or '-?' in argv:
+            print("""
+Unrecognized commands are IGNORED.
 
-
-# main function
-def tweet_frame():
-    global sec
-    global video
-    global season_index
-    global video_index
-    
-    video = get_video()
-    vid_length = get_length(video)
-    logger.critical(type(sec))
-    
-    if sec <= vid_length:
-    
-        time_string = f'frame {seconds_to_time(sec)} ({str(sec)}) from season {str(season_index + 1)}, video {str(video_index + 1)}'
+Usage:
+  -h
+  -?
+     ...what do you think this does?
+  
+  -test
+     Disables sending tweets and saving state.
+     
+  -tweet
+  -tweet number
+     Tweet number times, or once if no number is given. Asks for confirmation if -test isn't also passed.
+     
+  -inc_sec_dont_tweet
+     Increment to the next frame without actually sending anything. Useful when the bot crashes because it ran out of frames and you don't want to double post.
+     TODO: fix that"""
+                  )
+            exit()
         
-        # get frame from video
-        logger.info('Extracting frame at %s (%s)...', seconds_to_time(sec), str(sec))
-        success, frame = get_frame.get_frame(video, sec)
-        
-        logger.debug('sec of %s is less than or equal to length %s', str(sec), str(vid_length))
-        
-        if success:
-            #print(frame)
-            cv2.imwrite("tmp.png", frame)
-            
-            # upload frame to twitter, then get the media ID from that
-            image_id = upload_image_to_twitter("tmp.png")
-            
-            # tweet the image
-            send_tweet_with_media(image_id)
-            logger.info('Tweet sent with %s', time_string)
-            
-            # go forward for next frame
-            sec += randrange()
-                
-            hdutil.delete_file("tmp.png")
-            
-            time_string = f'frame {seconds_to_time(sec)} ({str(sec)}) from season {str(season_index + 1)}, video {str(video_index + 1)}'
-            
-            save_state()
-            
-            if sec > vid_length:
-                logger.info('Next run should switch to next episode, sec %s is greater than video length %s', str(sec), str(vid_length))
-            else:
-                logger.info('Next frame will be %s', time_string)
-                
+        if '-test' in argv:
+            testing_mode = True
         else:
-            if sec >= (vid_length - 1.5):
-                next_video_please()
+            testing_mode = False
+        
+        if '-tweet' in argv:
+            try:
+                times_to_tweet = int(argv[argv.index('-tweet') + 1])
+                if times_to_tweet < 1:
+                    exit('nothing below 1 for -tweet next time')
+            
+            except (ValueError, IndexError):
+                times_to_tweet = 1
+            
+            if testing_mode:
+                for i in range(times_to_tweet):
+                    self.main()
+            
+            elif input(f"Send {times_to_tweet} tweet{s_if(times_to_tweet > 1)}? (y/n): ").lower()[0] == 'y':
+                self.log.info(f"Tweeting {times_to_tweet} time{s_if(times_to_tweet > 1)}...")
+                for i in range(times_to_tweet):
+                    self.main()
+            
             else:
-                raise RuntimeError("Failed to extract frame at {sec}, Dont know how to deal with this.")
-                
-    else:
-        next_video_please()
-    sleep(1)
+                self.log.info("Not tweeting.")
         
-        
-if __name__ == '__main__':
-    print(sys.argv)
+        if '-inc_sec_dont_tweet' in argv:
+            self.log.info('Incrementing time and NOT sending tweet...')
+            self.main(dont_tweet_but_still_increment=True)
+            self.log.info('Time was incremented, exiting.')
+            exit()
     
-    read_state()
-    
-    if '-set_time' in sys.argv:
-        #api = None
-        #dont_save = True
-        #logger.warning('Starting in test mode.')
+    def load_state(self):
+        """Load screencap state, and create it if it doesn't exist."""
+        if not os.path.exists("./state.txt"):
+            write_file("./state.txt", "0\n0\n1")
+            self.log.info("Created state file, starting from the top!")
         
-        _time_flag = sys.argv[sys.argv.index('-set_time') + 1]
+        state = read_file("state.txt")
+        state_split = state.splitlines()
         
-        if str(_time_flag).startswith('('):
-            _time_split = str(_time_flag).replace('(','').replace(')','').split(',')
+        season = int(state_split[0])
+        episode = int(state_split[1])
+        _sec = state_split[2]
+        
+        # check if sec is in the tuple format (copied from the time_to_seconds method call spam below) to make specific frame testing easier
+        if _sec.startswith('('):
+            try:
+                _sec_split = _sec.split(",")
+            except:
+                raise ValueError(f"Couldn't load time: couldn't split up custom timestamp, no commas.\nRaw timestamp: {_sec}")
             
-            # convert them all to numbers
-            for i in range(len(_time_split)):
-                _time_split[i] = int(_time_split[i])
-                
-            # set sec to that
-            sec = float(time_to_seconds(_time_split[0], _time_split[1], _time_split[2], _time_split[3]))
-            print(sec)
+            if len(_sec_split) != 4:
+                raise ValueError(f"Couldn't load time: incorrect number of values in custom timestamp, expected 4, got {len(_sec_split)} values.\nRaw timestamp: {_sec}")
+            try:
+                _sec_split[0] = int(_sec_split[0][1:].strip())
+                _sec_split[1] = int(_sec_split[1].strip())
+                _sec_split[2] = int(_sec_split[2].strip())
+                _sec_split[3] = int(_sec_split[3][:-1].strip())
+            except:
+                raise ValueError(f"Failed to parse custom timestamp: expected format is '(hour, minutes, seconds, milliseconds)'.\nRaw timestamp: {_sec}")
             
-        # else, if its just a normal number like what this script saves, dont do funny stuff with it
+            sec = time_to_seconds(*_sec_split)
+        
+        # if its not, its just a normal float :)
         else:
-            sec = float(_time_flag)
+            sec = float(_sec)
         
-        save_state()
-        print('New time saved: {} ({})'.format(seconds_to_time(sec),sec))
-        #sec = float(sys.argv[sys.argv.index('-set_time') + 1])
+        self.log.info(f"State loaded: Season {str(season + 1)}, episode {str(episode + 1)} at {seconds_to_time(sec)}")
+        
+        return sec, episode, season
     
-    if '-test' in sys.argv:
-        api = None
-        dont_save = True
-        logger.warning('Starting in test mode.')
+    @self_do_nothing_if(lambda self: testing_mode, "State was not saved to disk.")
+    def save_state(self):
+        """Save screencap state."""
+        write_file("./state.txt", f"{str(self.season)}\n{str(self.episode)}\n{str(self.sec)}")
         
-    if '-reset' in sys.argv:
-        if '-test' in sys.argv:
-            logger.warning('State not cleared. Exiting anyway.')
-            reset_state()
-            
-        elif '-y' in sys.argv:
-            reset_state()
-            
+        self.log.info("State saved to disk.")
+    
+    def get_episode(self) -> str:
+        """Get current episode.
+        Goes to next season if the current one is over, and exits when the final season is over."""
+        
+        # try to set season, if more seasons than exist (series over), exit
+        try:
+            season = self.series.seasons[self.season]
+        except IndexError:
+            raise OutOfFramesError("No more frames, series is over. Congratulations!, unless it isn't and something broke...")
+        
+        # try to set video, if more videos than exist (season over), go to next season and reset video to 0
+        try:
+            episode = season.episodes[self.episode]
+        except IndexError:
+            self.season += 1
+            self.episode = 0
+            episode = self.get_episode()
+        
+        return episode
+    
+    def switch_to_next_episode(self) -> None:
+        """Switch to next episode, for use at the end of the if chains in main"""
+        self.episode += 1
+        self.sec = 0
+        
+        self.log.info("Switching to next episode.")
+        
+    def fixed_check_season_and_episode(self, season: int, episode: int) -> bool:
+        """One-indexed check the current season+episode, for making keeping track of the frames easier."""
+        return self.season == (season - 1) and self.episode == (episode - 1)
+        
+    def set_custom_next_frame(self, file: str):
+        """Make file the next frame instead of something from an episode"""
+        self.next_frame_custom_image = True
+        self.custom_frame = file
+        
+    def main(self, dont_tweet_still_increment=False):
+        if dont_tweet_still_increment:
+            self_api_tweet_image = lambda x: x
         else:
-            ask_reset = input('Reset state and start over at video 0? This cannot be undone. (y/n) : ')
-            if ask_reset.lower() == 'y':
-                reset_state()
-                
+            self_api_tweet_image = self.api.tweet_image
+        
+        episode = self.get_episode().path
+        
+        if get_frame.get_length(episode) >= self.sec:
+            # check if a custom frame is queued, if it is, use that instead of getting a frame.
+            if self.next_frame_custom_image:
+                frame = read_image(self.custom_frame)
+                success = True
+            
             else:
-                logger.warning('State not cleared. Exiting anyway.')
-                exit()
+                success, frame = get_frame.get_frame(episode, self.sec)
             
-    if '-tweet_now' in sys.argv:
-        if '-test' in sys.argv:
-            times_tweet = sys.argv[sys.argv.index('-tweet_now') + 1]
-            try: times_tweet = int(times_tweet)
-            except: times_tweet = 1
-            
-            for i in range(times_tweet):
-                tweet_frame()
-            
-        else:
-            ask_tweet = input('Send tweet now? (y/n) : ')
-            if ask_tweet.lower() == 'y':
-                tweet_frame()
+            if success:
+                save_image(frame, "temp.png")
                 
-            else:
-                logger.info('Tweet not sent. Starting normally.')
+                if self.next_frame_custom_image:
+                    self.log.info(f"{'NOT' if dont_tweet_still_increment else ''} Sending custom frame at {self.custom_frame} ({seconds_to_time(self.sec)} ({self.sec}))")
+                else:
+                    self.log.info(f"{'NOT' if dont_tweet_still_increment else ''} Sending frame at {seconds_to_time(self.sec)} ({self.sec})")
+                self.next_frame_custom_image = False
+                
+                self_api_tweet_image('temp.png')
+                
+                if self.fixed_check_season_and_episode(1, 1):
+                    if self.sec == time_to_seconds(0):
+                        raise OutOfFramesError("Ran out of frames while in episode!")
+                else:
+                    raise OutOfFramesError(f"New episode {self.episode} of seaoson {self.season + 1} has no frames!")
+                
+                self.save_state()
+                self.api.update_bio(f"""Tweeting hand-picked screenshots from {self.series.name} every 30 minutes, in order, again.
+Source code below.
+Now Playing: {self.series.seasons[self.season].name} {self.series.seasons[self.season].episodes[self.episode].name}""")
+                self.log.info(f"Next frame will be at {seconds_to_time(self.sec)} ({self.sec})")
         
-    schedule.every().hour.at(":00").do(tweet_frame)
-    schedule.every().hour.at(":30").do(tweet_frame)
-    
-    while True:
-        schedule.run_pending()
+        else:
+            self.switch_to_next_episode()
+        
         sleep(1)
-        
+
+
+if __name__ == '__main__':
+    bot = ScreencapBot(sys.argv, "ScreencapBot.kyf")
