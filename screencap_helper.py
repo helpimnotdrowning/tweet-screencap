@@ -1,23 +1,25 @@
 # WARNING: This helper was made for a 1680x1050 monitor. If you need to use it on a monitor with a different resolution, make an issue at https://github.com/helpimnotdrowning/tweet_screencap/issues
 
-import re
-from base64 import b64decode
+from re import sub, fullmatch, DOTALL
+from win32api import MessageBox
+from pyautogui import screenshot
+
 from io import BytesIO
 from time import sleep
-
-import pyautogui as phk
-import win32api
-from PIL.Image import open
-from numpy import asarray
+from base64 import b64decode
 from pyperclip import copy as to_clipboard
+from pytesseract import image_to_string
 
+from numpy import asarray
+from PIL.Image import open
+from PIL.ImageOps import invert
 """
 A quick guide to installing pytesseract on Windows, because it's difficult for some reason:
     1) Download the latest 64 bit installer from here : https://github.com/UB-Mannheim/tesseract/wiki#tesseract-installer-for-windows
     2) Install it for all users (install for current user *might* work, but not sure)
     3) Install pytesseract using pip ( `pip install pytesseract` )
 """
-from pytesseract import image_to_string
+
 from pynput.keyboard import Key, Listener, Controller
 
 # store images as base64 for ease of transport
@@ -25,64 +27,62 @@ find1 = b'iVBORw0KGgoAAAANSUhEUgAAABQAAAAJBAMAAADA7xF7AAAAKlBMVEUEBAT//wDAwMBCQk
 find2 = b'iVBORw0KGgoAAAANSUhEUgAAABQAAAAJBAMAAADA7xF7AAAAHlBMVEUAAAAEBAS/v7++vr59fQD+/v77+wDAwMCFhYX4+ADa1Qx6AAAAMklEQVR4nGNgAAFBIUMRAQYIU9UwAcosDzUUhDEjEMwOw5QJcCaSKIwpqGGYCGOCzAUAw1gJqN+0gBIAAAAASUVORK5CYII='
 
 
-# base64 bytes to PIL Image
 def b64_2_PIL_Image(b64):
+    """base64 bytes to PIL Image"""
     im_bytes = b64decode(b64)
     im_file = BytesIO(im_bytes)
     return open(im_file)
     
     
-# fixes int strings like '003' -> '3' so python doesnt SyntaxError me
 def fix_int(string):
+    """fixes int strings like '003' -> '3' so python doesnt SyntaxError me"""
     return str(int(string))
     
     
 def message_box(title, message):
-    win32api.MessageBox(0, message, title, 0x00001000)
+    """Show message box with an OK button on foreground"""
+    MessageBox(0, message, title, 0x00001000)
     
     
-# finds MPC-HC timestamp in screen
 def find_time():
-    # Instead of searching the whole screen, search only in the bottom left of the left middle of the screen
-    # ┌────────│──────┐
-    # │        │       │
-    # │        │       │
-    # └────────│──────┘
-    #         ^ here
-    screenshot = phk.screenshot(region=(656, 984, 154, 22))
+    """find MPC-HC timestamp onscreen"""
+    # Instead of searching the whole screen, search only in the middle-bottom-left (in that order). gives a bit of speedup
+    _screenshot = screenshot(region=(666,984,145,22))#(656,984,154,22)))
     
-    return image_to_string(asarray(screenshot), config="-c tessedit_char_whitelist=0123456789:.\/")
+    return image_to_string(asarray(_screenshot), config=r"-c tessedit_char_whitelist=0123456789:.\/")
 
 
 def fix_time(time):
-    """Fix up timestamp to be pasted into your local tweet_screencap.py"""
-    # using DOTALL because sometimes tesseract will also send some extra characters on a newline
-    stripped_time = re.sub('/.*', '', time, flags=re.DOTALL)
+    """fixes up timestamp to be directly pasted into tweet_screencap.py"""
+    print(time, " FIXING")
+    # DOTALL because sometimes tesseract will also send some extra characters on a newline
+    stripped_time = sub('/.*','',time, flags=DOTALL)
     
     # if the regex fails, it return the string unchanged, so this comparison is perfectly valid
     if stripped_time == time:
         print(f'\n\n{time}\n\n')
-        message_box("", "There was a problem parsing the time from MPC. Try another timestamp.")
+        message_box("1", "There was a problem parsing the time from MPC. Try another timestamp.")
         return
-    
+        
     # if the video is longer than an hour, MPC-HC will add a XX: to the start of the video elapsed time
     # it does not remove a XX: if the video is shorter than a minute, however.
-    if re.fullmatch('(\d\d:){1}\d\d\.\d\d\d', stripped_time):
+    if fullmatch('(\d{2}:){1}\d{2}(\.|\:)\d{3}', stripped_time):
         fixed_time = ', '.join(['0', fix_int(stripped_time[0:2]), fix_int(stripped_time[3:5]), fix_int(stripped_time[6:9])])
-    
-    elif re.fullmatch('(\d\d:){2}\d\d\.\d\d\d',stripped_time):
+        
+    elif fullmatch('(\d{2}:){2}\d{2}(\.|\:)\d{3}',stripped_time):
         fixed_time = ', '.join([fix_int(stripped_time[0:2]), fix_int(stripped_time[3:5]), fix_int(stripped_time[6:8]), fix_int(stripped_time[9:12])])
-    
+        
     else:
         print(f'\n\n{stripped_time}\n\n')
-        message_box("", "There was a problem parsing the time from MPC. Try another timestamp.")
+        message_box("2", "There was a problem parsing the time from MPC. Try another timestamp.")
         return
-    
+        
+    # paste directly into tweet_screencap.py
     if fixed_time == "0, 0, 0, 0":
         return f'''if self.sec == time_to_seconds({fixed_time}):  '''
     else:
         return f'''self.sec = time_to_seconds({fixed_time})
-                    elif self.sec == time_to_seconds({fixed_time}):  '''
+                        elif self.sec == time_to_seconds({fixed_time}):  '''
 
 
 def on_press(key): pass
@@ -94,7 +94,8 @@ def on_press(key): pass
 # pastes,
 # and then alt-tabs back
 def on_release(key):
-    if key == Key.shift:
+    """copy time to clipboard, alt-tab to last app and paste there, then alt-tab back"""
+    if key == Key.shift:   
         found_time = find_time()
         print(found_time)
         time = fix_time(found_time)
@@ -108,7 +109,7 @@ def on_release(key):
         with Controller().pressed(Key.alt):
             Controller().tap(Key.tab)
             
-        sleep(.5)  # pause for a bit because as to not send the paste to the task switcher and not notepad++
+        sleep(.5) # pause for a bit to not send paste to task switcher instead of editor
         Controller().press(Key.ctrl.value)
         Controller().tap('v')
         Controller().release(Key.ctrl.value)
@@ -121,9 +122,12 @@ def on_release(key):
 
 if __name__ == '__main__':
     
-    print("ello & ready, press SHIFT to go")
+    print("Ready, press SHIFT to copy...")
     
     # Collect events until released
-    with Listener(on_press=on_press, on_release=on_release) as listener:
+    with Listener(
+        on_press=on_press,
+        on_release=on_release) as listener:
         listener.join()
+        
         
